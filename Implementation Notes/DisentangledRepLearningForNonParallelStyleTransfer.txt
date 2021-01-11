@@ -1,0 +1,6 @@
+
+
+Model - 
+
+OrderedDict([('embedding', Embedding(9203, 300)), ('encoder', GRU(300, 256, batch_first=True, bidirectional=True)), ('content_mu', Linear(in_features=512, out_features=128, bias=True)), ('content_log_var', Linear(in_features=512, out_features=128, bias=True)), ('style_mu', Linear(in_features=512, out_features=8, bias=True)), ('style_log_var', Linear(in_features=512, out_features=8, bias=True)), ('style_disc', Linear(in_features=128, out_features=2, bias=True)), ('content_disc', Linear(in_features=8, out_features=7526, bias=True)), ('content_classifier', Linear(in_features=128, out_features=7526, bias=True)), ('style_classifier', Linear(in_features=8, out_features=2, bias=True)), ('decoder', GRUCell(436, 256)), ('projector', Linear(in_features=256, out_features=9203, bias=True)), ('dropout', Dropout(p=0.8, inplace=False))])
+

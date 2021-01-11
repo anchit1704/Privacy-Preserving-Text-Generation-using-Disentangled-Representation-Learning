@@ -1,0 +1,576 @@
+import torch
+import torch.nn as nn
+from linguistic_style_transfer_pytorch.config import ModelConfig, GeneralConfig
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+import math
+
+mconfig = ModelConfig()
+gconfig = GeneralConfig()
+
+class AdversarialVAE(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, weight):
+        super(AdversarialVAE, self).__init__()
+
+        #self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.embedding = nn.Embedding.from_pretrained(weight)
+        # ================ Encoder model =============#
+        self.encoder = nn.GRU(
+            mconfig.embedding_size, mconfig.hidden_dim, batch_first=True, bidirectional=True)
+        # content latent embedding
+        self.content_mu = nn.Linear(
+            2 * mconfig.hidden_dim, mconfig.content_hidden_dim)  # change content to content + sentiment style
+
+        # private attributes latent embedding
+        self.private_mu = nn.Linear(
+            2 * mconfig.hidden_dim, mconfig.private_hidden_dim)    # style here is the private attributes - age + gender + location
+
+        # =============== Discriminator/adversary============#
+        self.private_disc_age = nn.Linear(
+            mconfig.content_hidden_dim, mconfig.num_age)     # try to predict private attributes from utility latent rep
+
+        self.private_disc_rating = nn.Linear(
+            mconfig.private_hidden_dim, mconfig.num_style)
+        #self.private_disc_gender = nn.Linear(
+        #    mconfig.content_hidden_dim, mconfig.num_gender)
+        #self.private_disc_loc = nn.Linear(
+        #    mconfig.content_hidden_dim, mconfig.num_loc)
+        #self.content_disc = nn.Linear(
+        #    mconfig.private_hidden_dim, mconfig.content_bow_dim)  # try to predict utility attributes from private latent rep
+        #self.style_disc = nn.Linear(
+        #    mconfig.content_hidden_dim, mconfig.num_style)
+        #)
+        # =============== Classifier =============#
+        #self.content_classifier = nn.Linear(
+        #    mconfig.content_hidden_dim, mconfig.content_bow_dim)  #try to predict utility from utility latent rep
+        #self.style_classifier = nn.Linear(
+        #    mconfig.content_hidden_dim, mconfig.num_style)   #try to predict style attributes from utility latent rep
+        self.age_classifier = nn.Linear(
+            mconfig.private_hidden_dim, mconfig.num_age)  # try to predict age attributes from private latent rep
+        self.rating_classifier = nn.Linear(
+            mconfig.content_hidden_dim, mconfig.num_style)
+        #self.gender_classifier = nn.Linear(
+        #    mconfig.private_hidden_dim, mconfig.num_gender)  # try to predict age attributes from private latent rep
+        #self.location_classifier = nn.Linear(
+        #    mconfig.private_hidden_dim, mconfig.num_loc)   #try to predict age attributes from private latent rep
+
+        # =============== Decoder =================#
+        # Note: input embeddings are concatenated with the sampled latent vector at every step
+        self.decoder = nn.GRUCell(
+           mconfig.embedding_size + mconfig.generative_emb_dim, mconfig.hidden_dim)          # change generative_emb_dim size
+        self.projector = nn.Linear(mconfig.hidden_dim, mconfig.vocab_size) # vocab size because
+
+        # ============== Average label embedding ======#
+        # Used during inference to transfer style.
+        # Each element of the dict consists of average of latent style embeddings
+        # of all the sentences of that particular label/style.
+        # 0 -> negative, 1 -> positive
+        #self.avg_style_emb = {
+        #    0: torch.zeros(mconfig.private_hidden_dim),
+        #    1: torch.zeros(mconfig.private_hidden_dim)
+        #}
+        # Used to maintain a running average
+        self.num_neg_styles = 0
+        self.num_pos_styles = 0
+        # dropout
+        self.dropout = nn.Dropout(mconfig.dropout)
+
+    def forward(self, sequences, seq_lengths, age_labels, rating_labels, iteration, last_epoch):
+        seq_lengths, perm_index = seq_lengths.sort(descending=True)
+        sequences = sequences[perm_index]
+        embedded_seqs = self.dropout(self.embedding(sequences))
+        #packed_seqs = pack_padded_sequence(
+        #   embedded_seqs, lengths=seq_lengths, batch_first=True)
+        #packed_output, (_) = self.encoder(packed_seqs)
+        #output, _ = pad_packed_sequence(packed_output, batch_first=True)
+        output, (_) = self.encoder(embedded_seqs)
+
+        sentence_emb = output[torch.arange(output.size(0)), seq_lengths - 1]  # final hidden state
+        # get content and style embeddings from the sentence embeddings,i.e. final_hidden_state
+        content_emb = self.get_content_emb(
+            sentence_emb)
+        private_emb = self.get_private_emb(
+            sentence_emb)
+        # sample content and style embeddings from their respective latent spaces
+        #sampled_content_emb = self.sample_prior(
+        #    content_emb_mu, content_emb_log_var)   # remove the sample prior to make it a deterministic autoencoder
+        #sampled_private_emb = self.sample_prior(
+        #    private_emb_mu, private_emb_log_var)
+        # Generative embedding
+        generative_emb = torch.cat(
+           (private_emb, content_emb), axis=1)
+        # Update the average style embeddings for different styles
+        # This will be used in transfering the style of a sentence
+        # during inference
+
+       #if last_epoch:
+        #    self.update_average_style_emb(sampled_private_emb, age_labels)   # avg private emb
+
+        # =========== Losses on content space =============#
+        # Discriminator Loss
+        #content_disc_preds = self.get_content_disc_preds(sampled_private_emb)
+        # content_disc_loss = self.get_content_disc_loss(
+        #     content_disc_preds, content_bow)
+        # adversarial entropy
+        #content_entropy_loss = self.get_entropy_loss(content_disc_preds)
+        # Multitask loss
+        #content_mul_loss = self.get_content_mul_loss(
+        #    sampled_content_emb, content_bow)
+
+        # ============ Losses on private space ================#
+        # Discriminator loss
+        private_disc_age_preds = self.get_priv_disc_age_preds(content_emb)
+
+        style_disc_preds =   self.get_style_disc_preds(private_emb)
+
+        age_pred_disc = torch.argmax(private_disc_age_preds.data, dim=1)
+
+        rating_pred_disc = torch.argmax(style_disc_preds.data, dim=1)
+
+        private_disc_loss = self.get_private_disc_loss(
+            private_disc_age_preds, age_labels)
+
+        style_disc_loss = self.get_style_disc_loss(
+           style_disc_preds, rating_labels)
+
+
+        # adversarial entropy
+       # private_entropy_loss = self.get_entropy_loss(private_disc_preds)
+        # Multitask loss
+        age_preds_classifier, private_mul_loss = self.get_private_mul_loss(
+            private_emb, age_labels)
+
+        rating_pred_classifier, style_mul_loss = self.get_style_mul_loss(
+            content_emb, rating_labels)
+
+        age_preds_classifier = torch.argmax(age_preds_classifier.data, dim=1)
+        rating_pred_classifier = torch.argmax(rating_pred_classifier.data, dim=1)
+
+
+        # ============== KL losses ===========#
+        # Style space
+        #private_kl_loss = self.get_kl_loss(
+        #    private_emb_mu, private_emb_log_var)
+        #if iteration < mconfig.kl_anneal_iterations:
+        #    private_kl_loss = self.get_annealed_weight(
+        #        iteration, mconfig.style_kl_lambda) * private_kl_loss
+        # Content space
+        #content_kl_loss = self.get_kl_loss(
+        #    content_emb_mu, content_emb_log_var)
+        #if iteration < mconfig.kl_anneal_iterations:
+        #    content_kl_loss = self.get_annealed_weight(
+        #        iteration, mconfig.content_kl_lambda) * content_kl_loss
+
+        # =============== reconstruction ================#
+        reconstructed_sentences = self.generate_sentences(
+            sequences, generative_emb)
+        reconstruction_loss = self.get_recon_loss(
+            reconstructed_sentences, sequences)
+
+        # ================ total weighted loss ==========#
+
+
+        vae_and_classifier_loss =  reconstruction_loss +  mconfig.style_multitask_loss_weight * private_mul_loss + mconfig.style_multitask_loss_weight * style_mul_loss   - \
+                                   mconfig.style_adversary_loss_weight * private_disc_loss - mconfig.style_adversary_loss_weight * style_disc_loss
+
+        #vae_and_classifier_loss = config["style_adversary_loss_weight"] * private_entropy_loss + \
+        #                          config["style_multitask_loss_weight"] * private_mul_loss
+
+        return age_pred_disc, rating_pred_disc, age_preds_classifier, rating_pred_classifier, private_disc_loss, style_disc_loss, private_mul_loss, \
+               style_mul_loss,  vae_and_classifier_loss
+
+    def get_params(self):
+        """
+        Returns:
+            content_disc_params: parameters of the content discriminator/adversary
+            style_disc_params  : parameters of the style discriminator/adversary
+            other_params       : parameters of the vae and classifiers
+        """
+
+        #content_disc_params = self.content_disc.parameters()
+        private_disc_params = list(self.private_disc_age.parameters())
+        style_disc_params = list(self.private_disc_rating.parameters())
+        other_params = list(self.encoder.parameters())  + list(self.decoder.parameters()) + \
+            list(self.age_classifier.parameters()) + list(self.rating_classifier.parameters())
+
+        return private_disc_params, style_disc_params, other_params
+
+    def get_content_emb(self, sentence_emb):
+        """
+        Args:
+            sentence_emb: sentence embeddings of all the sentences in the batch, shape=(batch_size,2*gru_hidden_dim)
+        Returns:
+            mu: embedding of the mean of the Gaussian distribution of the content's latent space
+            log_var: embedding of the log of variance of the Gaussian distribution of the content's latent space
+        """
+        mu = self.content_mu(sentence_emb)
+        #log_var = self.content_log_var(sentence_emb)
+
+        return mu
+
+    def get_private_emb(self, sentence_emb):
+        """
+        Args:
+            sentence_emb: sentence embeddings of all the sentences in the batch, shape=(batch_size,2*gru_hidden_dim)
+        Returns:
+            mu: embedding of the mean of the Gaussian distribution of the style's latent space
+            log_var: embedding of the log of variance of the Gaussian distribution of the style's latent space
+        """
+        mu = self.private_mu(sentence_emb)
+        #log_var = self.private_log_var(sentence_emb)
+
+        return mu
+
+    def sample_prior(self, mu, log_var):
+        """
+        Returns samples drawn from the latent space constrained to
+        follow diagonal Gaussian
+        """
+        epsilon = torch.randn(mu.size(1),device=mu.device)
+        return mu + epsilon*torch.exp(log_var)
+
+    def update_average_style_emb(self, style_emb, style_labels):
+        """
+        Args:
+            style_emb: batch of sampled style embeddings of the input sentences,shape = (batch_size,mconfig.style_hidden_dim)
+            style_labels: style labels of the corresponding input sentences,shape = (batch_size,2)
+        """
+        neg_style_label = torch.LongTensor([0, 1], device=style_emb.device)
+        # Iterate over the style labels
+        for idx, label in enumerate(style_labels):
+            # Calculate average for negative style
+            if neg_style_label.equal(label):
+                # Increment the counter for negative styles
+                self.num_neg_styles = self.num_neg_styles + 1
+                # Calculate a running average of the negative style embedding
+                self.avg_style_emb[0] = (
+                    (self.num_neg_styles-1) * self.avg_style_emb[0] + style_emb[idx])/self.num_neg_styles
+            else:
+                # Increment the counter for positive styles
+                self.num_pos_styles = self.num_pos_styles + 1
+                # Calculate a running average of the positive style embedding
+                self.avg_style_emb[1] = (
+                    (self.num_pos_styles-1) * self.avg_style_emb[1] + style_emb[idx])/self.num_pos_styles
+        """
+
+    def get_content_disc_preds(self, style_emb):
+        """
+        """
+        Returns predictions about the content using style embedding
+        as input
+        output shape : [batch_size,content_bow_dim]
+        """
+        """
+        # predictions
+        # Note: detach the style embedding since when don't want the gradient to flow
+        #       all the way to the encoder. content_disc_loss is used only to change the
+        #       parameters of the discriminator network
+        preds = nn.Softmax(dim=1)(self.content_disc(
+            self.dropout(style_emb.detach())))
+
+        return preds
+
+    def get_content_disc_loss(self, content_disc_preds, content_bow):
+        """
+        """
+        It essentially quantifies the amount of information about content
+        contained in the style space
+        Returns:
+        cross entropy loss of content discriminator
+        """
+        """
+        # label smoothing
+        smoothed_content_bow = content_bow * \
+            (1-mconfig.label_smoothing) + \
+            mconfig.label_smoothing/mconfig.content_bow_dim
+        # calculate cross entropy loss
+        content_disc_loss = nn.BCELoss()(content_disc_preds, smoothed_content_bow)
+
+        return content_disc_loss
+
+        """
+
+    def get_priv_disc_age_preds(self, content_emb):
+        """
+        Returns predictions about style using content embeddings
+        as input
+        output shape: [batch_size,num_style]
+        """
+        # predictions
+        # Note: detach the content embedding since when don't want the gradient to flow
+        #       all the way to the encoder. style_disc_loss is used only to change the
+        #       parameters of the discriminator network
+        preds = nn.Softmax(dim=1)(self.private_disc_age(
+            self.dropout(content_emb.detach())))
+
+        return preds
+
+    def get_style_disc_preds(self, private_emb):
+        """
+        Returns predictions about style using content embeddings
+        as input
+        output shape: [batch_size,num_style]
+        """
+        # predictions
+        # Note: detach the content embedding since when don't want the gradient to flow
+        #       all the way to the encoder. style_disc_loss is used only to change the
+        #       parameters of the discriminator network
+        preds = nn.Softmax(dim=1)(self.private_disc_rating(
+            self.dropout(private_emb.detach())))
+
+        return preds
+
+    def get_private_disc_loss(self, private_disc_preds, private_attr_labels):
+        """
+        It essentially quantifies the amount of information about style
+        contained in the content space
+        Returns:
+        cross entropy loss of style discriminator
+        """
+        # label smoothing
+        #smoothed_style_labels = private_attr_labels * \
+        #                        (1-mconfig.label_smoothing) + \
+        #                        mconfig.label_smoothing / mconfig.num_style
+        # calculate cross entropy loss
+
+        style_disc_loss = nn.CrossEntropyLoss()(private_disc_preds, private_attr_labels)
+
+        return style_disc_loss
+
+    def get_style_disc_loss(self, style_disc_preds, style_attr_labels):
+        """
+        It essentially quantifies the amount of information about style
+        contained in the content space
+        Returns:
+        cross entropy loss of style discriminator
+        """
+        # label smoothing
+        #smoothed_style_labels = style_attr_labels * \
+        #                        (1-mconfig.label_smoothing) + \
+        #                        mconfig.label_smoothing / mconfig.num_style
+        # calculate cross entropy loss
+
+        style_disc_loss = nn.CrossEntropyLoss()(style_disc_preds, style_attr_labels)
+
+        return style_disc_loss
+
+    def get_entropy_loss(self, preds):
+        """
+        Returns the entropy loss: negative of the entropy present in the
+        input distribution
+        """
+        return - torch.mean(torch.sum(preds * torch.log(preds + mconfig.epsilon), dim=1))
+
+    def get_content_mul_loss(self, content_emb, content_bow):
+        """
+        This loss quantifies the amount of content information preserved
+        in the content space
+        Returns:
+        cross entropy loss of the content classifier
+        """
+        # predictions
+        preds = nn.Softmax(dim=1)(
+            self.content_classifier(self.dropout(content_emb)))
+        # label smoothing
+        smoothed_content_bow = content_bow * \
+            (1-mconfig.label_smoothing) + \
+            mconfig.label_smoothing/mconfig.content_bow_dim
+        # calculate cross entropy loss
+        content_mul_loss = nn.BCELoss()(preds, smoothed_content_bow)
+
+        return content_mul_loss
+
+    def get_private_mul_loss(self, style_emb, style_labels):
+        """
+        This loss quantifies the amount of style information preserved
+        in the style space
+        Returns:
+        cross entropy loss of the style classifier
+        """
+        # predictions
+        preds = nn.Softmax(dim=1)(
+            self.age_classifier(self.dropout(style_emb)))
+        # label smoothing
+        smoothed_style_labels = style_labels * \
+            (1-mconfig.label_smoothing) + \
+            mconfig.label_smoothing/mconfig.num_style
+        # calculate cross entropy loss
+        style_mul_loss = nn.CrossEntropyLoss()(preds, smoothed_style_labels)
+
+        return preds, style_mul_loss
+
+    def get_style_mul_loss(self, content_emb, style_labels):
+        """
+        This loss quantifies the amount of style information preserved
+        in the style space
+        Returns:
+        cross entropy loss of the style classifier
+        """
+        # predictions
+        preds = nn.Softmax(dim=1)(
+            self.rating_classifier(self.dropout(content_emb)))
+        # label smoothing
+        smoothed_style_labels = style_labels * \
+                                (1 - mconfig.label_smoothing) + \
+                                mconfig.label_smoothing / mconfig.num_style
+        # calculate cross entropy loss
+        style_mul_loss = nn.CrossEntropyLoss()(preds, smoothed_style_labels)
+
+        return preds, style_mul_loss
+
+    def get_annealed_weight(self, iteration, lambda_weight):
+        """
+        Args:
+            iteration(int): Number of iterations compeleted till now
+            lambda_weight(float): KL penalty weight
+        Returns:
+            Annealed weight(float)
+        """
+        return (math.tanh(
+            (iteration - mconfig.kl_anneal_iterations * 1.5) /
+            (mconfig.kl_anneal_iterations / 3))
+            + 1) * lambda_weight
+
+    def get_kl_loss(self, mu, log_var):
+        """
+        Args:
+            mu: batch of means of the gaussian distribution followed by the latent variables
+            log_var: batch of log variances(log_var) of the gaussian distribution followed by the latent variables
+        Returns:
+            total loss(float)
+        """
+        kl_loss = torch.mean((-0.5*torch.sum(1+log_var -
+                                             log_var.exp()-mu.pow(2), dim=1)))
+        return kl_loss
+
+    def generate_sentences(self, input_sentences, latent_emb, inference=False):
+        """
+        Args:
+            latent_emb: generative embedding formed by the concatenation of sampled style and
+                       content latent embeddings, shape = (batch_size,mconfig.generative_emb_dim)
+            input_sentences: batch of token indices of input sentences, shape = (batch_size,max_seq_length)
+                            It is of type 'None' when the function is called in inference mode
+            inference: bool indicating whether train/inference mode
+        Returns:
+            output_sentences: batch of token indices or logits of generated sentences based on the
+            mode of operation.
+            modes:
+                train: shape = (max_seq_len,batch_size,vocab_size)
+                inference: shape = (max_seq_len,batch_size)
+        """
+        # Training mode
+        if not inference:
+            # Prepend the input sentences with <sos> token
+            sos_token_tensor = torch.cuda.LongTensor(
+                [gconfig.predefined_word_index['<sos>']], device=input_sentences.device).unsqueeze(0).repeat(input_sentences.shape[0], 1)
+            input_sentences = torch.cat(
+                (sos_token_tensor, input_sentences), dim=1)
+            sentence_embs = self.dropout(self.embedding(input_sentences))
+            # Make the latent embedding compatible for concatenation
+            # by repeating it for max_seq_len + 1(additional one bcoz <sos> tokens were added)
+            latent_emb = latent_emb.unsqueeze(1).repeat(
+                1, input_sentences.shape[1], 1)
+            gen_sent_embs = torch.cat(
+                (sentence_embs, latent_emb), dim=2)
+            # Delete latent embedding and sos token tensor to reduce memory usage
+            del latent_emb, sos_token_tensor
+            output_sentences = torch.zeros(
+                input_sentences.shape[1] -1, input_sentences.shape[0], mconfig.vocab_size, device=input_sentences.device)
+            # initialize hidden state
+            hidden_states = torch.zeros(
+                input_sentences.shape[0], mconfig.hidden_dim, device=input_sentences.device)
+            # generate sentences one word at a time in a loop
+            for idx in range(input_sentences.shape[1] - 1):
+                # get words at the index idx from all the batches
+                words = gen_sent_embs[:, idx, :]
+                hidden_states = self.decoder(words, hidden_states)
+                # project over vocab space
+                next_word_logits = self.projector(hidden_states)
+                output_sentences[idx] = next_word_logits
+        # if inference mode is on
+        else:
+
+            sos_token_tensor = torch.LongTensor(
+                [gconfig.predefined_word_index['<sos>']], device=latent_emb.device).unsqueeze(0)
+            word_emb = self.embedding(sos_token_tensor)
+            hidden_states = torch.zeros(
+                1, mconfig.hidden_dim, device=latent_emb.device)
+            # Store output sentences
+            output_sentence = torch.zeros(
+                mconfig.max_seq_len, 1, device=latent_emb.device)
+            with torch.no_grad:
+                # Greedily generate new words at a time
+                for idx in range(mconfig.max_seq_len):
+                    hidden_state = self.decoder(word_emb, hidden_state)
+                    next_word_probs = nn.Softmax(dim=1)(
+                        self.projector(hidden_state))
+                    next_word = next_word_probs.argmax(1)
+                    output_sentence[idx] = next_word
+                    word_emb = self.embedding(next_word)
+
+        return output_sentences
+
+    def get_recon_loss(self, output_logits, input_sentences):
+        """
+        Args:
+            output_logits: logits of output sentences at each time step, shape = (max_seq_length,batch_size,vocab_size)
+            input_sentences: batch of token indices of input sentences, shape = (batch_size,max_seq_length)
+
+        Returns:
+            reconstruction loss calculated using cross entropy loss function
+        """
+
+        loss = nn.CrossEntropyLoss(ignore_index=0)
+        recon_loss = loss(
+            output_logits.view(-1, mconfig.vocab_size), input_sentences.view(-1))
+
+        return recon_loss
+
+    def transfer_style(self, sequence, style):
+        """
+        Args:
+            sequence : token indices of input sentence of shape = (random_seq_length,)
+            style: target style
+        Returns:
+            transfered_sentence: token indices of style transfered sentence, shape=(random_seq_length,)
+        """
+        # pack the sequences to reduce unnecessary computations
+        # It requires the sentences to be sorted in descending order to take
+        # full advantage
+
+        embedded_seq = self.embedding(sequence.unsqueeze(0))
+        output, final_hidden_state = self.encoder(embedded_seq)
+
+        # get content embeddings
+        # Note that we need not calculate style embeddings since we
+        # use the target style embedding
+        content_emb_mu, content_emb_log_var = self.get_content_emb(
+            final_hidden_state)
+        # sample content embeddings latent space
+        sampled_content_emb = self.sample_prior(
+            content_emb_mu, content_emb_log_var)
+        # Get the approximate estimate of the target style embedding
+        target_style_emb = self.avg_style_emb[style]
+        # Generative embedding
+        generative_emb = torch.cat(
+            (target_style_emb, sampled_content_emb), axis=1)
+        # Generate the style transfered sentences
+        transfered_sentence = self.generate_sentences(
+            input_sentencs=None, latent_emb=generative_emb, inference=True)
+
+        return transfered_sentence.view(-1)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

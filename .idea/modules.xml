@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/Privacy-Preserving-Text-Generation-using-Disentangled-Representation-Learning.iml" filepath="$PROJECT_DIR$/.idea/Privacy-Preserving-Text-Generation-using-Disentangled-Representation-Learning.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/linguistic-style-transfer-pytorch.iml" filepath="$PROJECT_DIR$/.idea/linguistic-style-transfer-pytorch.iml" />
     </modules>
   </component>
 </project>
